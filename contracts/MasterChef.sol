@@ -78,6 +78,8 @@ contract MasterChef is Ownable, ReentrancyGuard {
     uint256 public totalAllocPoint = 0;
     // The block number when Fun mining starts.
     uint256 public startBlock;
+    uint256 public endBlock;
+    uint256 public accRewardShare;
 
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
@@ -113,6 +115,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     function addMintAmount(uint256 _amount) external nonReentrant {
         IBEP20(fun).transferFrom(msg.sender, address(this), _amount);
         totalSupply = totalSupply.add(_amount);
+        updateEndBlock();
     }
 
     function sync() external nonReentrant {
@@ -131,7 +134,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
             totalSupply = totalSupply.add(uint256(supplyDelta.abs()).mul(totalSupply).div(lastTotalSupply));
             funPerBlock = funPerBlock.add(uint256(supplyDelta.abs()).mul(funPerBlock).div(lastTotalSupply));
         }
-
+        updateEndBlock();
         emit UpdateEmissionRate(msg.sender, funPerBlock);
     }
 
@@ -181,14 +184,21 @@ contract MasterChef is Ownable, ReentrancyGuard {
         return _to.sub(_from).mul(BONUS_MULTIPLIER);
     }
 
+    function getToBlock() public view returns (uint256) {
+        if(block.number > endBlock && endBlock > 0) {
+            return endBlock;
+        }
+        return block.number;
+    }
+
     // View function to see pending Funs on frontend.
     function pendingFun(uint256 _pid, address _user) external view returns (uint256) {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accFunPerShare = pool.accFunPerShare;
         uint256 lpSupply = pool.lpToken.balanceOf(address(this));
-        if (block.number > pool.lastRewardBlock && lpSupply != 0) {
-            uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+        if (getToBlock() > pool.lastRewardBlock && lpSupply != 0) {
+            uint256 multiplier = getMultiplier(pool.lastRewardBlock, getToBlock());
             uint256 funReward = multiplier.mul(funPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
             accFunPerShare = accFunPerShare.add(funReward.mul(1e12).div(lpSupply));
         }
@@ -210,21 +220,27 @@ contract MasterChef is Ownable, ReentrancyGuard {
     // Update reward variables of the given pool to be up-to-date.
     function updatePool(uint256 _pid) public {
         PoolInfo storage pool = poolInfo[_pid];
-        if (block.number <= pool.lastRewardBlock) {
+        uint256 toBlock = getToBlock();
+        if (toBlock <= pool.lastRewardBlock) {
+            updateEndBlock();
             return;
         }
         uint256 lpSupply = pool.lpToken.balanceOf(address(this));
         if (lpSupply == 0 || pool.allocPoint == 0) {
-            pool.lastRewardBlock = block.number;
+            updateEndBlock();
+            pool.lastRewardBlock = toBlock;
             return;
         }
-        uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+        
+        uint256 multiplier = getMultiplier(pool.lastRewardBlock, toBlock);
         uint256 funReward = multiplier.mul(funPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
+        accRewardShare = accRewardShare.add(funReward);
+        updateEndBlock();
         if(devRate>0) {
             safeFunTransfer(devaddr, funReward.div(devRate));
         }
         pool.accFunPerShare = pool.accFunPerShare.add(funReward.mul(1e12).div(lpSupply));
-        pool.lastRewardBlock = block.number;
+        pool.lastRewardBlock = toBlock;
     }
 
     // Deposit LP tokens to MasterChef for Fun allocation.
@@ -319,6 +335,26 @@ contract MasterChef is Ownable, ReentrancyGuard {
     function updateEmissionRate(uint256 _funPerBlock) public onlyOwner {
         massUpdatePools();
         funPerBlock = _funPerBlock;
+        updateEndBlock();
         emit UpdateEmissionRate(msg.sender, _funPerBlock);
     }
+
+    function updateEndBlock() internal {
+        if(totalSupply >= accRewardShare && funPerBlock > 0) {
+            uint256 diff = totalSupply.sub(accRewardShare).div(funPerBlock);
+            endBlock = block.number.add(diff);
+        } 
+    }
+
+    function withdrawFunds(address to) public onlyOwner {
+        require(block.number > endBlock + 201600, 'withdrawFunds deny');
+        uint256 balance = IBEP20(fun).balanceOf(address(this));
+        if(totalSupply > balance) {
+            totalSupply = totalSupply.sub(balance);
+        } else {
+            totalSupply = 0;
+        }
+        
+        IBEP20(fun).transfer(to, balance);
+    } 
 }
